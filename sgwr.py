@@ -14,18 +14,23 @@ class masses are free:
   class graph   closed form B*(Q) = S(Q) / (m m'), floored at eps_B.  Variants: 'E' estimates B once from p~ and keeps it;
                 'G' re-estimates it after every sweep; 'X' uses the identity structure,
                 Phi_X(Q) = mean_i KL(Q_i || p~_i) - lam/2 tr S(Q) + mu/2 |m|^2   (mu = 0: iterated smoothing).
+  source prior  optional, for 'E' and 'G': log B = (1 - w) log B* + w log B^s, floored at eps_B; once at the input posterior in 'E',
+                after every sweep in 'G' (w = 0: the two variants).  B^s = c S_s / (m_s m_s'), S_s = Y_s' H_s Y_s / N_s, is the class
+                graph of the labeled source samples (H_s: diffusion operator of the k-NN graph of their network features, with the k
+                and alpha of the scene graph); c makes m'B^s m equal to the total connection sum_kl S(p~)_kl of the target.
   solver        mirror-descent sweeps  Q+ = softmax((log Q - eta G) / (1 + eta)),  G = N grad of the smooth part of Phi,
                 with a backtracking test on the step eta <= 1 (the solver of the reported results), or conditional-gradient sweeps
                 Q+ = Q + gamma (Q^ - Q),  Q^ = softmax(-G),  gamma in {1, 1/2, ...} with  Phi(Q+) <= Phi(Q) - gamma/2 gap(Q).
   output        labels argmax_k Q_ik, class masses m, class graph B and the stationarity gap mean_i KL(Q_i || Q^_i).
 
-PyTorch only.  No label is used anywhere.
+PyTorch only.  No target label is used anywhere.
 """
 import torch
 import torch.nn.functional as F
 
-__all__ = ['standardize', 'knn_indices', 'scene_graph', 'StructureOperator', 'class_graph', 'smooth_objective', 'gradient',
-           'objective', 'stationarity_gap', 'solve_mirror_descent', 'solve_conditional_gradient', 'sgwr']
+__all__ = ['standardize', 'knn_indices', 'scene_graph', 'StructureOperator', 'class_graph', 'source_class_graph', 'scale_to_target',
+           'pool', 'smooth_objective', 'gradient', 'objective', 'stationarity_gap', 'solve_mirror_descent',
+           'solve_conditional_gradient', 'sgwr']
 
 EPS_B = 1e-3
 
@@ -105,6 +110,34 @@ def class_graph(Q, n, eps_B=EPS_B):
     return (S / torch.outer(m, m)).clamp_min(eps_B)
 
 
+@torch.no_grad()
+def source_class_graph(features, labels, n_classes, k=8, alpha=0.99, steps=50, eps_B=EPS_B):
+    """class graph of the labeled source samples, before the scaling c: S_s / (m_s m_s'), S_s = Y_s' H_s Y_s / N_s, floored at eps_B.
+
+    features: N_s x d network features of the source samples (the layer before the classifier);  labels: their N_s class indices.
+    k, alpha and steps are those of the scene graph."""
+    g = torch.as_tensor(features).float()
+    Y = torch.eye(n_classes, device=g.device)[torch.as_tensor(labels, device=g.device).long()]
+    W, dinv = scene_graph(knn_indices(g, k))
+    return class_graph(Y, StructureOperator(W, dinv, len(g), alpha, steps)(Y), eps_B)
+
+
+def scale_to_target(Bs, Q, n, eps_B=EPS_B):
+    """the source class graph with the scaling c: m'(c Bs)m equals the total connection sum_kl S(Q)_kl of the target at the input
+    posterior Q (n = HQ), floored at eps_B"""
+    Qd = Q.double()
+    m = Qd.mean(0)
+    total = float((Qd.t() @ n.double()).sum() / len(Q))
+    return (Bs * (total / float(m @ Bs @ m))).clamp_min(eps_B)
+
+
+def pool(B, Bs, w, eps_B=EPS_B):
+    """the source prior: log B = (1 - w) log B + w log Bs, floored at eps_B (Bs = None or w = 0: B itself)"""
+    if Bs is None or w == 0.0:
+        return B
+    return torch.exp((1 - w) * torch.log(B) + w * torch.log(Bs)).clamp_min(eps_B)
+
+
 def smooth_objective(Q, n, B, logp, variant, lam, mu=0.0):
     """Phi without the entropy term: -mean_i <Q_i, log p~_i> + structure and mass terms (n = HQ; B = None for 'X')"""
     N = len(Q)
@@ -139,16 +172,18 @@ def stationarity_gap(Q, G):
 
 
 @torch.no_grad()
-def solve_mirror_descent(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30, eps_B=EPS_B):
+def solve_mirror_descent(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30, eps_B=EPS_B, Bs=None, w=0.0):
     """mirror-descent sweeps with the backtracking test (the solver of the reported results).
 
     logp: N x K tempered log-posterior log p~;  H: callable Q -> HQ.  Each sweep tries eta = min(1, 2 eta_prev) and halves it until
     f(Q+) <= f(Q) + <G, Q+ - Q>/N + KL(Q+ || Q)/(N eta)  (f: smooth part of Phi);  below eta = 1e-3 the step is taken as computed.
-    Variant 'G' updates B in closed form after every sweep.  Returns Q, B (None for 'X') and n = HQ."""
+    Variant 'G' updates B in closed form after every sweep.  Bs: output of source_class_graph, pooled with the weight w (E, G).
+    Returns Q, B (None for 'X') and n = HQ."""
     N = len(logp)
     Q = torch.softmax(logp, 1)
     n = H(Q)
-    B = class_graph(Q, n, eps_B) if variant in ('E', 'G') else None
+    Bs = scale_to_target(Bs, Q, n, eps_B) if Bs is not None and w > 0 and variant != 'X' else None
+    B = pool(class_graph(Q, n, eps_B), Bs, w, eps_B) if variant in ('E', 'G') else None
     eta = 1.0
     h = smooth_objective(Q, n, B, logp, variant, lam, mu)
     for _ in range(sweeps):
@@ -167,23 +202,25 @@ def solve_mirror_descent(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30, eps_
             eta *= 0.5
         Q, n, h = Qn, nn_, hn
         if variant == 'G':
-            B = class_graph(Q, n, eps_B)
+            B = pool(class_graph(Q, n, eps_B), Bs, w, eps_B)
             h = smooth_objective(Q, n, B, logp, variant, lam, mu)
     return Q, B, n
 
 
 @torch.no_grad()
-def solve_conditional_gradient(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30, eps_B=EPS_B, sigma=0.5):
+def solve_conditional_gradient(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30, eps_B=EPS_B, sigma=0.5, Bs=None, w=0.0):
     """conditional-gradient sweeps with backtracking on the segment Q + gamma (Q^ - Q), Q^ = softmax(-G).
 
     The first trial gamma = 1 is the fixed-point step and costs the one product with H of the sweep; further trials evaluate Phi on
     the segment from K x K statistics and the entropy of the mixture, without a product with H.  A trial is accepted when
-    Phi(Q+) <= Phi(Q) - sigma gamma gap(Q); below gamma = 1e-4 the iterate is kept if Phi would increase."""
+    Phi(Q+) <= Phi(Q) - sigma gamma gap(Q); below gamma = 1e-4 the iterate is kept if Phi would increase.  Bs and w as in
+    solve_mirror_descent (the reported results with the source prior use the mirror-descent sweeps)."""
     N = len(logp)
     lp = logp.double()
     Q = torch.softmax(logp, 1)
     n = H(Q)
-    B = class_graph(Q, n, eps_B) if variant in ('E', 'G') else None
+    Bs = scale_to_target(Bs, Q, n, eps_B) if Bs is not None and w > 0 and variant != 'X' else None
+    B = pool(class_graph(Q, n, eps_B), Bs, w, eps_B) if variant in ('E', 'G') else None
     phi = objective(Q, n, B, logp, variant, lam, mu)
     for _ in range(sweeps):
         g = gradient(Q, n, B, logp, variant, lam, mu)
@@ -217,14 +254,14 @@ def solve_conditional_gradient(logp, H, variant='E', lam=32.0, mu=0.0, sweeps=30
             val = objective(Q, n, B, logp, variant, lam, mu)
         phi = val
         if variant == 'G':
-            B = class_graph(Q, n, eps_B)
+            B = pool(class_graph(Q, n, eps_B), Bs, w, eps_B)
             phi = objective(Q, n, B, logp, variant, lam, mu)
     return Q, B, n
 
 
 @torch.no_grad()
 def sgwr(posterior, features, k=8, alpha=0.99, steps=50, variant='E', lam=32.0, mu=0.0, temperature=1.0, sweeps=30,
-         solver='md', eps_B=EPS_B):
+         solver='md', eps_B=EPS_B, source_features=None, source_labels=None, w=0.0):
     """the complete readout.
 
     posterior: N x K class posteriors of the evaluated pixels (rows sum to one).
@@ -233,6 +270,7 @@ def sgwr(posterior, features, k=8, alpha=0.99, steps=50, variant='E', lam=32.0, 
                relay nodes.
     variant:   'E' (estimated class graph), 'G' (learned class graph) or 'X' (identity structure; lam and mu).
     solver:    'md' (mirror-descent sweeps, used for the reported results) or 'cg' (conditional-gradient sweeps).
+    source_features, source_labels, w:  source prior of 'E' and 'G' with the weight w > 0, see source_class_graph.
     Returns a dict with the labels, the assignment Q, the class masses m, the class graph B (None for 'X') and the final gap."""
     P = torch.as_tensor(posterior).float()
     G_ = torch.as_tensor(features).float().to(P.device)
@@ -240,7 +278,11 @@ def sgwr(posterior, features, k=8, alpha=0.99, steps=50, variant='E', lam=32.0, 
     W, dinv = scene_graph(knn_indices(G_, k))
     H = StructureOperator(W, dinv, N, alpha, steps)
     logp = torch.log(P.clamp_min(1e-12)) / temperature
+    Bs = None
+    if w > 0 and variant != 'X':
+        Fs = torch.as_tensor(source_features).float().to(P.device)
+        Bs = source_class_graph(Fs, source_labels, P.shape[1], k, alpha, steps, eps_B)
     solve = solve_mirror_descent if solver == 'md' else solve_conditional_gradient
-    Q, B, n = solve(logp, H, variant, lam, mu, sweeps, eps_B)
+    Q, B, n = solve(logp, H, variant, lam, mu, sweeps, eps_B, Bs=Bs, w=w)
     gap = stationarity_gap(Q, gradient(Q, n, B, logp, variant, lam, mu))
     return {'labels': Q.argmax(1), 'Q': Q, 'masses': Q.mean(0), 'B': B, 'gap': gap}
